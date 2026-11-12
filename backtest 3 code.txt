@@ -1,0 +1,222 @@
+# region imports
+from AlgorithmImports import *
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize     # SciPy's minimize function is used to search for portfolio weights that optimise the selected objective.
+# endregion
+
+
+class MonthlyRebalancedPortfolio(QCAlgorithm):
+    """
+    Q2(ii): long-only portfolio of the 10 US stocks, rebuilt on the first trading day of every month.
+
+    TECHNIQUE: Markowitz mean-variance optimisation, choosing the weights that give the
+    MAXIMUM SHARPE RATIO (the best return for each unit of risk).
+
+    RULES (from the assignment):
+      * Long only (no short selling).
+      * Every stock gets at least 5% of the portfolio.
+      * The portfolio is rebalanced at the beginning of every month.
+
+    HOW THE WEIGHTS ARE CHOSEN (every month):
+      1. Take the daily returns of the 10 stocks over the last 252 trading days (about 1 year).
+         Only data from 1 Jan 2023 onwards is used (that is the data period of the assignment),
+         and only days BEFORE today are used, so there is no peeking into the future.
+      2. From these returns compute each stock's average return and how the stocks move together
+         (the covariance matrix).
+      3. Let the optimiser find the weights (each >= 5%, adding up to 100%) with the highest
+         Sharpe ratio.
+      4. Buy / sell so the account matches these weights.
+
+    SPECIAL CASES:
+      * Until 60 days of data exist (Jan - Mar 2023) there is too little data to estimate
+        anything sensible, so the portfolio is equally weighted (10% each).
+      * If NO stock has an average return above the risk-free rate, "maximum Sharpe" does not
+        make sense, so that month the minimum-variance portfolio is used instead.
+      * If the optimiser fails, equal weights are used and the failure is counted.
+
+    Change self.opt_method to "min_variance" below to run the minimum-variance version instead.
+    """
+
+    def initialize(self):
+        # Basic settings establish the backtest period and the starting account balance specified in the assignment.
+        self.set_start_date(2023, 1, 1)     # 1 January 2023 falls on a Sunday, so the first available market session is 3 January 2023.
+        self.set_end_date(2026, 1, 1)
+        self.set_cash(100000)               # The portfolio starts with $100,000 in cash before any stocks are purchased.
+
+        # These parameters control the optimisation method, the amount of historical data used, and the portfolio constraints.
+        self.opt_method = "max_sharpe"      # Select either maximum Sharpe ratio or minimum variance as the method for choosing portfolio weights.
+        self.lookback = 252                 # Use approximately one year of historical trading data when estimating returns and risk.
+        self.min_days = 60                  # At least 60 daily return observations are required before the optimisation is considered reliable enough to run.
+        self.min_weight = 0.05              # The weight of each stock cannot fall below 5%, as required by the assignment.
+        self.rf_rate = 0.04                 # A 4% annual risk-free rate is assumed when calculating the Sharpe ratio.
+        self.data_start = datetime(2023, 1, 1)   # Historical observations before 1 January 2023 are excluded to keep the analysis within the assignment period.
+
+        # Define the ten securities specified in the assignment.
+        self.tickers = ["AAPL", "MSFT", "JPM", "LLY", "TGT", "AOS", "NOG", "POR", "FDX", "PYPL"]
+        # Minute-level data allows orders to be placed near the beginning of the first trading session of each month.
+        self.stocks = [self.add_equity(t, Resolution.MINUTE).symbol for t in self.tickers]
+        self.symbol_of = {s.value: s for s in self.stocks}    # Create a lookup that maps each ticker name to its corresponding QuantConnect Symbol object.
+
+        # Use the NYSE Composite Index as the benchmark so performance can be compared with the equal-weight portfolio from Question 2(i).
+        nya = self.add_index("NYA", Resolution.DAILY).symbol
+        self.set_benchmark(nya)
+
+        # Initialise variables used to track monthly rebalancing and optimisation outcomes.
+        self.last_month = None        # Store the year and month of the most recent rebalance to prevent repeated trades during the same month.
+        self.started = False          # This flag becomes True after the first portfolio allocation has been placed.
+        self.rebalance_count = 0
+        self.opt_failures = 0
+
+        # Keep the original equal-weight portfolio's holdings for comparison; these holdings are not rebalanced here.
+        # These share quantities and the remaining cash are taken from the Question 2(i) backtest results.
+        ew_shares = {"LLY": 28, "PYPL": 137, "JPM": 81, "NOG": 406, "AOS": 185,
+                     "POR": 239, "AAPL": 78, "FDX": 94, "MSFT": 42, "TGT": 75}
+        self.ew_shares = {self.symbol_of[t]: q for t, q in ew_shares.items()}
+        self.ew_cash = 512.26
+
+        # Record both portfolio values shortly before the market closes each trading day for the comparison chart.
+        self.schedule.on(self.date_rules.every_day(self.stocks[0]),
+                         self.time_rules.before_market_close(self.stocks[0], 1),
+                         self.record_comparison)
+
+    # -------------------------------------------------------------------------
+    # New market data arrives through this method. The month check identifies when a new monthly allocation is due.
+    # -------------------------------------------------------------------------
+    def on_data(self, data: Slice):
+        # Avoid making portfolio decisions outside regular market hours.
+        if not self.is_market_open(self.stocks[0]):
+            return
+
+        # Check the year and month and rebalance only the first time valid market data is available in a new month.
+        month_id = (self.time.year, self.time.month)
+        if month_id == self.last_month:
+            return
+
+        # Wait until every stock has a valid positive price so the target allocation can be applied to all ten securities.
+        if not all(self.securities[s].price > 0 for s in self.stocks):
+            return
+
+        # First, calculate the portfolio weights using the selected optimisation method or fallback rule.
+        weights, label = self.compute_weights()
+
+        # Apply the target weights to the account. QuantConnect adjusts existing holdings by selling or buying as needed.
+        self.set_holdings([PortfolioTarget(s, float(w)) for s, w in zip(self.stocks, weights)])
+
+        self.last_month = month_id
+        self.started = True
+        self.rebalance_count += 1
+
+        # Record the selected weights in the log so the monthly allocations can be reviewed in the report.
+        text = ", ".join(f"{t} {w * 100:.1f}%" for t, w in zip(self.tickers, weights))
+        self.log(f"{self.time.date()} [{label}] {text}")
+
+    # -------------------------------------------------------------------------
+    # Estimate the portfolio weights for the current month and return both the weights and a label describing the method used.
+    # -------------------------------------------------------------------------
+    def compute_weights(self):
+        n = len(self.stocks)
+        equal = np.repeat(1.0 / n, n)
+
+        # Retrieve daily closing prices from the start of the assignment period through the current date.
+        hist = self.history(self.stocks, self.data_start, self.time, Resolution.DAILY)
+        if hist.empty:
+            return equal, "equal weights: no data yet"
+        closes = hist["close"].unstack(level=0)
+        closes.columns = [str(c).split(" ")[0] for c in closes.columns]   # Convert QuantConnect's full symbol labels into simple ticker names for the price table columns.
+        closes = closes[self.tickers]                                      # Arrange the columns in the same order as the ticker list so each weight stays matched to the correct stock.
+        closes = closes[closes.index.date < self.time.date()]              # Exclude the current day's observations because they would not have been available before today's trading decision.
+
+        # Calculate daily percentage changes and retain only the most recent observations within the chosen lookback window.
+        rets = closes.pct_change().dropna().tail(self.lookback)
+        if len(rets) < self.min_days:
+            return equal, f"equal weights: only {len(rets)} days of data"
+
+        # Annualise the estimated average daily returns and covariance matrix using 252 trading days per year.
+        mu = rets.mean().values * 252
+        cov = rets.cov().values * 252
+
+        # Apply the optimisation approach selected in the strategy settings.
+        if self.opt_method == "min_variance":
+            return self.min_variance(cov), "min variance"
+        if mu.max() <= self.rf_rate:
+            # If the highest estimated annual return does not exceed the assumed risk-free rate, use the minimum-variance approach instead.
+            return self.min_variance(cov), "min variance: no stock beats risk-free rate"
+        return self.max_sharpe(mu, cov), "max Sharpe"
+
+    # -------------------------------------------------------------------------
+    # Find the weights that maximise the portfolio's estimated Sharpe ratio.
+    # -------------------------------------------------------------------------
+    def max_sharpe(self, mu, cov):
+        n = len(mu)
+        start = np.repeat(1.0 / n, n)          # Start the numerical search from an equal allocation across all ten stocks.
+
+        # The optimiser minimises functions, so the negative Sharpe ratio is minimised to obtain the maximum Sharpe ratio.
+        def negative_sharpe(w):
+            portfolio_return = w @ mu
+            portfolio_risk = np.sqrt(w @ cov @ w)
+            return -(portfolio_return - self.rf_rate) / portfolio_risk
+
+        return self.run_optimiser(negative_sharpe, start)
+
+    # -------------------------------------------------------------------------
+    # Find the allocation with the lowest estimated portfolio variance.
+    # -------------------------------------------------------------------------
+    def min_variance(self, cov):
+        n = cov.shape[0]
+        start = np.repeat(1.0 / n, n)
+
+        def variance(w):
+            return w @ cov @ w
+
+        return self.run_optimiser(variance, start)
+
+    # -------------------------------------------------------------------------
+    # Run the optimiser subject to the long-only minimum-weight rule and the requirement that all weights sum to 100%.
+    # -------------------------------------------------------------------------
+    def run_optimiser(self, objective, start):
+        n = len(start)
+        result = minimize(objective, start, method="SLSQP",
+                          bounds=[(self.min_weight, 1.0)] * n,
+                          constraints=[{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}],
+                          options={"maxiter": 500})
+        if (not result.success) or np.any(np.isnan(result.x)):
+            self.opt_failures += 1
+            self.log(f"{self.time.date()}: optimiser failed ({result.message}), using equal weights")
+            return start
+        return self.fix_weights(result.x)
+
+    # -------------------------------------------------------------------------
+    # Correct the resulting weights to ensure that every stock receives at least 5% and the full portfolio adds up to 100%.
+    # Each stock first receives the 5% minimum; the remaining allocation is distributed in proportion to the extra weight proposed by the optimiser.
+    # -------------------------------------------------------------------------
+    def fix_weights(self, w):
+        n = len(w)
+        floor = self.min_weight
+        extra = np.maximum(w - floor, 0.0)           # Keep only the portion of each proposed weight that exceeds the required minimum allocation.
+        if extra.sum() <= 0:
+            return np.repeat(1.0 / n, n)
+        return floor + extra * (1.0 - n * floor) / extra.sum()
+
+    # -------------------------------------------------------------------------
+    # Compare the optimised portfolio's daily value with the fixed holdings from the equal-weight buy-and-hold strategy.
+    # -------------------------------------------------------------------------
+    def record_comparison(self):
+        if not self.started:
+            return
+        ew_value = self.ew_cash + sum(q * self.securities[s].price for s, q in self.ew_shares.items())
+        self.plot("Optimised vs Equal-weight", "Optimised portfolio", self.portfolio.total_portfolio_value)
+        self.plot("Optimised vs Equal-weight", "Equal-weight (Q2 i)", ew_value)
+
+    # -------------------------------------------------------------------------
+    # Print the final account value, the number of monthly rebalances, optimisation failures, and each stock's ending position.
+    # -------------------------------------------------------------------------
+    def on_end_of_algorithm(self):
+        total = self.portfolio.total_portfolio_value
+        self.log(f"Final portfolio value: {total:,.2f}")
+        self.log(f"Monthly rebalances: {self.rebalance_count}, optimiser failures: {self.opt_failures}")
+        for s in self.stocks:
+            h = self.portfolio[s]
+            self.log(f"{s.value}: shares={h.quantity}, value={h.holdings_value:,.2f}, "
+                     f"weight={h.holdings_value / total:.1%}")
