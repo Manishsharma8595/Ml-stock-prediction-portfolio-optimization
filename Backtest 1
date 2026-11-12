@@ -1,0 +1,243 @@
+from AlgorithmImports import *
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from xgboost import XGBRegressor      # Imports the XGBoost regression model used to predict the next closing price.
+
+
+# =============================================================================
+# Question 1(iv): A PYPL trading strategy that uses an XGBoost forecast to decide whether to buy, short, or remain in cash.
+#
+# The account starts with $100,000 in total capital and uses a margin account.
+# The first $50,000 is reserved to meet the strategy's margin requirement.
+# This reserved amount is not included when calculating the size of a trade.
+# The remaining $50,000 is the trading budget used to size both long and short positions.
+# If account equity falls, the available trading budget is reduced so the reserved $50,000 is protected.
+#
+# A decision is made one minute after the market opens each trading day, using information available
+# through the previous trading day's close. This avoids using that day's closing price in the prediction.
+# If the predicted close is at least 0.5% above the previous close, the algorithm opens a long position.
+# The long position is held until the market price reaches 0.5% above its entry price, then it is sold.
+# If the predicted close is at least 0.5% below the previous close, the algorithm opens a short position.
+# The short position is closed before the market closes on the same day.
+# If neither threshold is met, no position is opened and the account stays in cash.
+# =============================================================================
+
+
+class PYPLXGBoostStrategy(QCAlgorithm):
+
+    def initialize(self):
+        # ---------------------------------------------------------------------
+        # 1. Set the backtest dates and the starting account balance.
+        # ---------------------------------------------------------------------
+        # The start date matches the test period identified in the Research notebook; the model is trained on earlier data.
+        start_year, start_month, start_day = 2025, 2, 18
+        self.set_start_date(start_year, start_month, start_day)
+        self.set_end_date(2026, 1, 1)
+
+        self.set_cash(100000)                  # Sets the initial portfolio value to $100,000.
+
+        # Select a margin account so the algorithm can submit both long and short orders.
+        self.set_brokerage_model(BrokerageName.QUANT_CONNECT_BROKERAGE,
+                                 AccountType.MARGIN)
+
+        # This setting keeps 50% of the portfolio value available as a buffer for order checks.
+        # It does not create a separate cash account or reserve a second amount of money.
+        # The strategy's actual $50,000 trading limit is calculated separately in trading_amount_available().
+        self.settings.free_portfolio_value_percentage = 0.50
+
+        self.margin_requirement = 50000        # Amount reserved for margin and excluded from the trade budget.
+        self.trade_amount = 50000              # Maximum amount allocated to each trade before applying the available-equity limit.
+
+        self.symbol = self.add_equity("PYPL", Resolution.MINUTE).symbol
+
+        # ---------------------------------------------------------------------
+        # 2. Define the strategy rules and variables used to track positions.
+        # ---------------------------------------------------------------------
+        self.threshold = 0.005                 # Sets the prediction trigger and long exit target to 0.5%.
+        self.open_trade = None                 # Stores details of the currently tracked open trade; None means no trade is being tracked.
+        self.trade_log = []                    # Collects details of completed trades for the end-of-backtest summary.
+
+        # These eight input columns must match the features used when the model was trained in the Research notebook.
+        self.feature_cols = ["close", "ret_1", "ret_5", "sma_5", "sma_20",
+                             "vol_chg", "volume", "rsi_14"]
+
+        # ---------------------------------------------------------------------
+        # 3. Train the XGBoost model using daily data available before the backtest begins.
+        # ---------------------------------------------------------------------
+        train_start = datetime(2023, 1, 1)
+        train_end = datetime(start_year, start_month, start_day)
+        self.model = self.train_model(train_start, train_end)
+
+        # ---------------------------------------------------------------------
+        # 4. Schedule the strategy's daily decision and short-position closing tasks.
+        # ---------------------------------------------------------------------
+        # Run the prediction and decide whether to open a position one minute after the market opens.
+        self.schedule.on(self.date_rules.every_day(self.symbol),
+                         self.time_rules.after_market_open(self.symbol, 1),
+                         self.morning_decision)
+
+        # Close any remaining short position two minutes before the market closes to keep shorts within the same day.
+        self.schedule.on(self.date_rules.every_day(self.symbol),
+                         self.time_rules.before_market_close(self.symbol, 2),
+                         self.close_short)
+
+    # -------------------------------------------------------------------------
+    # Train the XGBoost model using historical daily prices and volumes.
+    # -------------------------------------------------------------------------
+    def train_model(self, train_start, train_end):
+        bars = self.history(self.symbol, train_start, train_end, Resolution.DAILY)
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.droplevel(0)
+        # Exclude the backtest start date and retain only observations strictly earlier than that date.
+        bars = bars[bars.index.date < train_end.date()]
+
+        data = self.build_features(bars)
+        data["target"] = bars["close"].shift(-1)   # Assigns the next trading day's closing price as the value the model must predict.
+        # The final row has no next-day closing price within the downloaded training period,
+        # so it cannot be used as a labelled training example and is removed below.
+        data = data.iloc[:-1]
+        data = data.replace([np.inf, -np.inf], np.nan)
+        data = data.dropna(subset=self.feature_cols + ["target"])
+
+        model = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=4)
+        model.fit(data[self.feature_cols], data["target"])
+
+        self.debug(f"Model trained on {len(data)} days. "
+                   f"First day: {data.index[0].date()}, last day: {data.index[-1].date()}")
+        return model
+
+    # -------------------------------------------------------------------------
+    # Create the price, return, moving-average, volume, and momentum inputs for the model.
+    # -------------------------------------------------------------------------
+    def build_features(self, df):
+        d = pd.DataFrame(index=df.index)
+        d["close"]   = df["close"]
+        d["ret_1"]   = df["close"].pct_change(1)
+        d["ret_5"]   = df["close"].pct_change(5)
+        d["sma_5"]   = df["close"].rolling(5).mean()
+        d["sma_20"]  = df["close"].rolling(20).mean()
+        d["vol_chg"] = df["volume"].pct_change()
+        d["volume"]  = df["volume"]
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        d["rsi_14"] = 100 - 100 / (1 + gain / loss)
+        return d
+
+    # -------------------------------------------------------------------------
+    # Calculate the portion of the account that can be used for a new trade.
+    # -------------------------------------------------------------------------
+    def trading_amount_available(self):
+        # The trade budget cannot exceed $50,000, and the account must retain at least
+        # $50,000 in equity for the margin requirement. If equity declines, the usable
+        # amount falls accordingly; it never becomes negative.
+        equity = self.portfolio.total_portfolio_value
+        return max(0.0, min(self.trade_amount, equity - self.margin_requirement))
+
+    # -------------------------------------------------------------------------
+    # Make the daily trading decision one minute after the market opens.
+    # -------------------------------------------------------------------------
+    def morning_decision(self):
+        # Do not open another position while the current PYPL position is still active.
+        if self.portfolio[self.symbol].invested:
+            return
+
+        # Build the prediction from completed daily bars only, so today's closing price is not used.
+        bars = self.history(self.symbol, 60, Resolution.DAILY)
+        if bars.empty:
+            return
+        if isinstance(bars.index, pd.MultiIndex):
+            bars = bars.droplevel(0)
+        bars = bars[bars.index.date < self.time.date()]
+        if len(bars) < 30:
+            return
+
+        features = self.build_features(bars)
+        x = features.iloc[[-1]][self.feature_cols]
+        predicted_close = float(self.model.predict(x)[0])
+        yesterday_close = float(bars["close"].iloc[-1])
+        change = predicted_close / yesterday_close - 1
+
+        # Calculate the order size from the available trading budget, using the current market price.
+        price = float(self.securities[self.symbol].price)
+        if not np.isfinite(price) or price <= 0:
+            return
+        amount = self.trading_amount_available()
+        # Apply a 0.5% reduction to the budget to leave room for price changes and trading costs.
+        quantity = int((amount * 0.995) // price)
+
+        self.debug(f"{self.time.date()}: predicted {predicted_close:.2f}, "
+                   f"yesterday {yesterday_close:.2f}, change {change:+.2%}")
+
+        if quantity < 1:
+            return
+        if change >= self.threshold:
+            self.market_order(self.symbol, quantity)        # A positive quantity opens a long position.
+        elif change <= -self.threshold:
+            self.market_order(self.symbol, -quantity)       # A negative quantity opens a short position.
+        # If the predicted change falls between the two thresholds, no order is placed and the algorithm remains in cash.
+
+    # -------------------------------------------------------------------------
+    # Record filled orders so each completed position can be included in the trade summary.
+    # -------------------------------------------------------------------------
+    def on_order_event(self, order_event):
+        if order_event.status != OrderStatus.FILLED:
+            return
+
+        holding = self.portfolio[self.symbol]
+        fill_price = order_event.fill_price
+
+        # When a filled order creates a non-zero holding and no trade is being tracked, record the entry details.
+        if holding.quantity != 0 and self.open_trade is None:
+            self.open_trade = {
+                "date": self.time.date(),
+                "side": "LONG" if holding.quantity > 0 else "SHORT",
+                "qty": holding.quantity,
+                "entry": fill_price,
+            }
+
+        # When a filled order leaves the holding at zero, record the exit and calculate the realised trade result.
+        elif holding.quantity == 0 and self.open_trade is not None:
+            t = self.open_trade
+            pnl = (fill_price - t["entry"]) * t["qty"]    # This signed-quantity calculation gives positive P&L for profitable long and short trades.
+            self.trade_log.append({"date": t["date"], "side": t["side"],
+                                   "qty": abs(t["qty"]), "entry": t["entry"],
+                                   "exit": fill_price, "pnl": pnl})
+            self.debug(f"{self.time.date()} CLOSE {t['side']} {abs(t['qty'])} sh, "
+                       f"entry {t['entry']:.2f}, exit {fill_price:.2f}, P&L {pnl:,.2f}")
+            self.open_trade = None
+
+    # -------------------------------------------------------------------------
+    # Check each incoming data update and exit a long position when its 0.5% profit target is reached.
+    # -------------------------------------------------------------------------
+    def on_data(self, data):
+        if self.open_trade is None or self.open_trade["side"] != "LONG":
+            return
+        if self.transactions.get_open_orders(self.symbol):
+            return                                  # Avoids submitting another exit while an order for this symbol is already open.
+        price = self.securities[self.symbol].price
+        if price >= self.open_trade["entry"] * (1 + self.threshold):
+            self.liquidate(self.symbol)
+
+    # -------------------------------------------------------------------------
+    # Close a short position before the end of the trading day, if one is still open.
+    # -------------------------------------------------------------------------
+    def close_short(self):
+        if self.portfolio[self.symbol].is_short:
+            self.liquidate(self.symbol)
+
+    # -------------------------------------------------------------------------
+    # Summarise the completed trades after the backtest finishes.
+    # -------------------------------------------------------------------------
+    def on_end_of_algorithm(self):
+        trades = self.trade_log
+        if not trades:
+            self.log("No closed trades.")
+            return
+        total = sum(t["pnl"] for t in trades)
+        wins = sum(1 for t in trades if t["pnl"] > 0)
+        longs = sum(1 for t in trades if t["side"] == "LONG")
+        self.log(f"Closed trades: {len(trades)} (long {longs}, short {len(trades) - longs})")
+        self.log(f"Winning trades: {wins} ({wins / len(trades):.1%})")
+        self.log(f"Total trading P&L: ${total:,.2f}")
