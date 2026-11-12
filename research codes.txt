@@ -1,0 +1,438 @@
+# %%
+# CELL 1: Load daily closing prices for the ten securities listed in the assignment. The resulting table is used for the return calculations and later comparisons.
+from datetime import datetime
+import pandas as pd
+
+# QuantBook provides access to historical market data inside the QuantConnect research environment.
+qb = QuantBook()
+
+# These are the ten assigned tickers, covering different sectors as required by the assignment.
+tickers = ["AAPL", "MSFT", "JPM", "LLY", "TGT", "AOS", "NOG", "POR", "FDX", "PYPL"]
+
+# Add each security at daily resolution so that the downloaded observations represent trading days.
+# QuantConnect assigns each ticker a Symbol object, which is used to request and identify its data.
+symbols = {t: qb.add_equity(t, Resolution.DAILY).symbol for t in tickers}
+
+# Request the full sample period specified in the assignment, from 1 January 2023 up to 1 January 2026.
+history = qb.history(list(symbols.values()),
+                     datetime(2023, 1, 1), datetime(2026, 1, 1),
+                     Resolution.DAILY)
+
+# Reshape the history into a table with dates as rows and individual stocks as columns, keeping closing prices only.
+close = history["close"].unstack(level=0)
+close.columns = [str(c).split(" ")[0] for c in close.columns]  # use tickers as column names
+
+print(close.shape)   # (number of days, number of stocks)
+close.head()         # show the first 5 rows
+close
+
+# %%
+close.describe() # Summary statistics such as the count, mean, standard deviation, minimum, and quartiles of each stock's closing price.
+
+# %%
+# CELL 2: Calculate and plot daily returns for all ten securities on a shared chart.
+import matplotlib.pyplot as plt
+
+# Percentage change in the closing price from the previous trading day gives the daily return.
+returns = close.pct_change().dropna()
+
+plt.figure(figsize=(14, 6))
+for t in returns.columns:                       # Each iteration adds one stock's daily-return series to the same chart, making the movement of all securities comparable.
+    plt.plot(returns.index, returns[t], label=t, linewidth=0.8)
+
+plt.title("Daily returns of the 10 stocks (Jan 2023 - Jan 2026)")
+plt.xlabel("Date")
+plt.ylabel("Daily return")
+plt.legend(ncol=5)
+plt.show()
+
+# %%
+# CELL 3: Summarise the daily returns numerically so that typical performance and extreme daily movements can be compared.
+summary = pd.DataFrame({
+    "Average daily return (%)": returns.mean() * 100,
+    "Daily volatility (%)":     returns.std() * 100,    # Standard deviation of daily returns, expressed as a percentage; a larger value means returns varied more from day to day.
+    "Best day (%)":             returns.max() * 100,
+    "Best day date":            returns.idxmax().dt.date,
+    "Worst day (%)":            returns.min() * 100,
+    "Worst day date":           returns.idxmin().dt.date,
+})
+summary.round(2).sort_values("Daily volatility (%)", ascending=False)
+
+# %%
+# CELL 4: Compare cumulative price growth by showing how one dollar invested in each stock would have changed over time.
+growth = (1 + returns).cumprod()     # Compound each day's return with all earlier returns to calculate the investment's growth path.
+
+plt.figure(figsize=(14, 6))
+for t in growth.columns:
+    plt.plot(growth.index, growth[t], label=t)
+
+plt.title("Growth of $1 invested in each stock (Jan 2023 - Jan 2026)")
+plt.xlabel("Date")
+plt.ylabel("Value of $1")
+plt.legend(ncol=5)
+plt.show()
+
+# %%
+# CELL 5: Calculate price-based performance and risk measures for each stock over the sample period.
+import numpy as np
+
+trading_days = 252     # Approximate number of trading days in a year, used to annualise daily measures.
+risk_free = 0.04       # Assumed annual risk-free rate of 4%; this assumption should also be stated in the written report.
+
+# SPY is used as a broad-market proxy when calculating each stock's beta.
+spy_symbol = qb.add_equity("SPY", Resolution.DAILY).symbol
+spy_hist = qb.history(spy_symbol, datetime(2023,1,1), datetime(2026,1,1), Resolution.DAILY)
+spy_returns = spy_hist["close"].droplevel(0).pct_change().dropna()
+
+# Create a results table with one row for each stock and add the selected measures as columns.
+stats = pd.DataFrame(index=returns.columns)
+
+# Total return measures the percentage change between the first and last observed closing prices.
+stats["Total return (%)"] = (close.iloc[-1] / close.iloc[0] - 1) * 100
+
+# Annualised volatility scales the standard deviation of daily returns to an approximate yearly measure of risk.
+stats["Annual volatility (%)"] = returns.std() * np.sqrt(trading_days) * 100
+
+# The Sharpe ratio compares annualised excess return with annualised volatility; a higher value indicates more return per unit of risk.
+annual_return = returns.mean() * trading_days
+stats["Sharpe ratio"] = (annual_return - risk_free) / (returns.std() * np.sqrt(trading_days))
+
+# Maximum drawdown measures the largest percentage decline from a previous cumulative peak to a later trough.
+growth = (1 + returns).cumprod()
+stats["Max drawdown (%)"] = (growth / growth.cummax() - 1).min() * 100
+
+# Beta measures the stock's sensitivity to movements in SPY; a value near 1 indicates similar market sensitivity.
+stats["Beta vs SPY"] = [returns[t].cov(spy_returns) / spy_returns.var() for t in returns.columns]
+
+# The 5th percentile of daily returns is used as the 95% daily VaR threshold, showing the return level in the lower tail of outcomes.
+stats["Daily VaR 95% (%)"] = returns.quantile(0.05) * 100
+
+stats.round(2)
+
+# %%
+# CELL 6: Collect selected company fundamentals for the end of 2025, where data is available from QuantConnect.
+# The fundamental fields are supplied through QuantConnect's Morningstar data feed.
+# The December 2025 history is checked and the latest available record for each security is retained.
+fund_history = qb.history[Fundamental](list(symbols.values()),
+                                       datetime(2025, 12, 1), datetime(2026, 1, 1))
+
+latest = {}                                 # Store the most recent fundamental record found for each ticker.
+for day in fund_history:                    # Go through the available dates in chronological order.
+    for symbol, f in day.items():           # Check the fundamental record for every stock available on that date.
+        latest[symbol.value] = f            # Replace the earlier record so that the final stored value is the latest one encountered.
+
+def safe(getter):
+    """Try to read a value. If it is missing, return NaN instead of crashing."""
+    try:
+        return float(getter())
+    except Exception:
+        return float("nan")
+
+rows = []
+for t in tickers:
+    f = latest.get(t)
+    rows.append({
+        "Ticker": t,
+        "Market cap ($ bn)":  safe(lambda: f.market_cap) / 1e9,
+        "P/E ratio":          safe(lambda: f.valuation_ratios.pe_ratio),
+        "Dividend yield (%)": safe(lambda: f.valuation_ratios.trailing_dividend_yield) * 100,
+        "ROE (%)":            safe(lambda: f.operation_ratios.roe.value) * 100,
+    })
+
+fundamentals = pd.DataFrame(rows).set_index("Ticker")
+fundamentals.round(2)
+
+# %%
+# CELL 7: Combine the price-based measures and fundamental measures into one comparison table.
+# Join the two tables using the ticker as the matching index, placing both sets of statistics side by side.
+final_table = stats.join(fundamentals)
+
+# Round the displayed values to two decimal places to make the table easier to read.
+final_table.round(2)
+
+# %%
+# CELL 7b: Examine how closely the daily returns of the ten securities move together.
+# Correlation ranges from -1 to +1: positive values indicate returns tend to move together, while negative values indicate opposite movement.
+corr = returns.corr()
+
+plt.figure(figsize=(9, 7))
+plt.imshow(corr, cmap="RdYlGn", vmin=-1, vmax=1)
+plt.colorbar(label="Correlation")
+plt.xticks(range(len(corr)), corr.columns, rotation=45)
+plt.yticks(range(len(corr)), corr.columns)
+
+# Add each pair's correlation value to its corresponding square so the chart can be read without estimating from colour alone.
+for i in range(len(corr)):
+    for j in range(len(corr)):
+        plt.text(j, i, f"{corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=8)
+
+plt.title("Correlation of daily returns")
+plt.show()
+
+# %%
+# CELL 8: Prepare the input features and next-day closing-price target for the machine-learning models.
+import numpy as np
+import pandas as pd
+
+chosen = ["JPM", "PYPL"]          # JPM and PYPL are the two securities selected for the prediction exercise.
+
+# Download daily open, high, low, close, and volume observations for the two selected securities.
+hist = qb.history([symbols[t] for t in chosen],
+                  datetime(2023, 1, 1), datetime(2026, 1, 1), Resolution.DAILY)
+
+def make_features(df):
+    """Takes one stock's table and adds input columns (features)."""
+    d = pd.DataFrame(index=df.index)
+    d["close"]   = df["close"]
+    d["ret_1"]   = df["close"].pct_change(1)      # Percentage change in closing price over one trading day.
+    d["ret_5"]   = df["close"].pct_change(5)      # Percentage change in closing price over the previous five trading days.
+    d["sma_5"]   = df["close"].rolling(5).mean()  # Average closing price over the latest five observations.
+    d["sma_20"]  = df["close"].rolling(20).mean() # Average closing price over the latest twenty observations.
+    d["vol_chg"] = df["volume"].pct_change()      # Percentage change in trading volume compared with the previous observation.
+    d["volume"]  = df["volume"]
+
+# RSI is a 14-period momentum measure intended to indicate the balance between recent upward and downward price movements.
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    d["rsi_14"] = 100 - 100 / (1 + gain / loss)
+
+# The target is shifted one row upward so each row's features are paired with the following trading day's closing price.
+    d["target"] = df["close"].shift(-1)
+    return d.dropna()
+
+data = {}
+for t in chosen:                                   # Process each selected stock separately, applying the same feature construction steps to both.
+    df = hist.loc[symbols[t]]                      # Select the historical observations belonging to the current ticker before creating its features.
+    data[t] = make_features(df)
+
+data["JPM"].head()
+
+# %%
+# CELL 9: Train an XGBoost regression model to estimate the next trading day's closing price.
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+import matplotlib.pyplot as plt
+
+feature_cols = ["close","ret_1","ret_5","sma_5","sma_20","vol_chg","volume","rsi_14"]
+xgb_results = {}
+
+for t in chosen:
+    d = data[t]
+    split = int(len(d) * 0.7)                     # Use the first 70% of observations for model fitting, leaving the later 30% for out-of-sample evaluation.
+    train, test = d.iloc[:split], d.iloc[split:]  # Keep the time order intact: earlier observations train the model and later observations test its predictions.
+
+    model = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=4)
+    model.fit(train[feature_cols], train["target"])
+
+    pred = model.predict(test[feature_cols])
+    rmse = np.sqrt(mean_squared_error(test["target"], pred))
+    mape = mean_absolute_percentage_error(test["target"], pred) * 100
+    xgb_results[t] = (rmse, mape)
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(test.index, test["target"], label="Actual close")
+    plt.plot(test.index, pred, label="XGBoost predicted close")
+    plt.title(f"{t}: XGBoost, actual vs predicted next-day close")
+    plt.legend(); plt.show()
+    print(t, "RMSE:", round(rmse, 2), " MAPE (%):", round(mape, 2))
+
+# %%
+# CELL 10: Train an LSTM neural network for next-day closing-price prediction.
+from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+tf.random.set_seed(42); np.random.seed(42)   # Set random seeds to make the model's results more reproducible across runs.
+
+window = 10                                  # Each LSTM input sequence contains the most recent ten days of feature values.
+lstm_results = {}
+
+for t in chosen:
+    d = data[t]
+    split = int(len(d) * 0.7)                # Use the same chronological 70% training and 30% testing split as the XGBoost model for comparison.
+
+# Scale the input features and target to the 0-to-1 range, which can help neural-network training.
+# Fit each scaler using training observations only, avoiding the use of test-period information when estimating scaling limits.
+    x_scaler = MinMaxScaler().fit(d[feature_cols].iloc[:split])
+    y_scaler = MinMaxScaler().fit(d[["target"]].iloc[:split])
+    X_all = x_scaler.transform(d[feature_cols])
+    y_all = y_scaler.transform(d[["target"]])
+
+# Form rolling sequences in which ten consecutive days of features are used to predict the target associated with the sequence's final day.
+    X_seq, y_seq = [], []
+    for i in range(window - 1, len(d)):
+        X_seq.append(X_all[i - window + 1 : i + 1])
+        y_seq.append(y_all[i])
+    X_seq, y_seq = np.array(X_seq), np.array(y_seq)
+
+    n_train = split - window + 1             # Calculate how many sequences belong to the training period after accounting for the ten-day input window.
+    X_train, y_train = X_seq[:n_train], y_seq[:n_train]
+    X_test = X_seq[n_train:]
+    actual = d["target"].iloc[split:]        # Keep the actual target values for the test period so predictions can be evaluated against observed closing prices.
+
+# The network contains an LSTM layer to learn sequential patterns, dropout to help limit overfitting, and one output for the predicted price.
+    model = Sequential([
+        LSTM(32, input_shape=(window, len(feature_cols))),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    model.fit(X_train, y_train, epochs=50, batch_size=16, verbose=0)
+
+# Convert the model's scaled predictions back to the original dollar-price scale before calculating error measures.
+    pred = y_scaler.inverse_transform(model.predict(X_test, verbose=0)).ravel()
+
+    rmse = np.sqrt(mean_squared_error(actual, pred))
+    mape = mean_absolute_percentage_error(actual, pred) * 100
+    lstm_results[t] = (rmse, mape)
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(actual.index, actual, label="Actual close")
+    plt.plot(actual.index, pred, label="LSTM predicted close")
+    plt.title(f"{t}: LSTM, actual vs predicted next-day close")
+    plt.legend(); plt.show()
+    print(t, "RMSE:", round(rmse, 2), " MAPE (%):", round(mape, 2))
+
+
+# %%
+# CELL 11: Compare the prediction errors from XGBoost and LSTM for each selected stock.
+comparison = pd.DataFrame({
+    "XGBoost RMSE": {t: xgb_results[t][0] for t in chosen},
+    "XGBoost MAPE (%)": {t: xgb_results[t][1] for t in chosen},
+    "LSTM RMSE": {t: lstm_results[t][0] for t in chosen},
+    "LSTM MAPE (%)": {t: lstm_results[t][1] for t in chosen},
+})
+comparison.round(2)
+
+# %%
+# Identify the date boundary of the 70% training sample so the strategy backtest can use a later period.
+d = data["PYPL"]                      # Use PYPL here because it is the stock selected for the XGBoost-based trading strategy.
+split = int(len(d) * 0.7)             # Calculate the row that separates the training observations from the test observations.
+
+print("Training ends on:", d.index[split - 1].date())
+print("Use this as the backtest START DATE:", d.index[split + 1].date())
+
+# %%
+# Calculate the return from holding PYPL over the same approximate period as the strategy backtest, for a simple benchmark.
+pypl = close["PYPL"]
+period = pypl["2025-02-18":"2025-12-31"]
+print("First close:", round(period.iloc[0], 2), " Last close:", round(period.iloc[-1], 2))
+print("Buy-and-hold return (%):", round((period.iloc[-1] / period.iloc[0] - 1) * 100, 2))
+
+# Check whether the observed high price after the purchase date reached the intended sell-trigger level.
+h = hist.loc[symbols["PYPL"]]            # Retrieve PYPL's daily price history, including high prices used for the trigger check.
+print("Highest price after 28 Jul:", round(h.loc["2025-07-29":]["high"].max(), 2))
+
+# %%
+# Check whether QuantConnect can retrieve historical data for the NYSE Composite index, identified by ticker NYA.
+try:
+    nya = qb.add_index("NYA", Resolution.DAILY).symbol
+    test = qb.history(nya, datetime(2023, 1, 1), datetime(2026, 1, 1), Resolution.DAILY)
+    print("Rows of data:", len(test))
+    print(test.head(3))
+except Exception as e:
+    print("NYA not available:", e)
+
+# %%
+# =============================================================================
+# CELL 15 (research notebook): Question 2(i) — compare the equal-weight portfolio with the NYSE Composite index.
+# The comparison uses the holdings recorded in the portfolio backtest and index data for the same period.
+#
+# Run the earlier research cells first so that the closing-price table named close has already been created.
+# =============================================================================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# 1. Record the number of shares purchased for each stock at the start of the portfolio backtest, based on the Orders tab.
+shares = {"LLY": 28, "PYPL": 137, "JPM": 81, "NOG": 406, "AOS": 185,
+          "POR": 239, "AAPL": 78, "FDX": 94, "MSFT": 42, "TGT": 75}
+
+# The backtest purchases whole shares, so a small amount of the initial cash remains uninvested after transaction costs.
+# This leftover cash is taken from the backtest log: ending portfolio value less the ending market value of the ten stock positions.
+cash_left = 512.26
+start_cash = 100000.0
+risk_free = 0.04          # Use the same assumed annual risk-free rate as in the earlier performance-statistics section.
+trading_days = 252
+
+# 2. Calculate the portfolio's daily market value by multiplying each holding by its closing price and adding the remaining cash.
+prices = close[list(shares.keys())].copy()                # 'close' table from Cell 1
+prices.index = pd.to_datetime(prices.index).normalize()   # keep only the date, drop the time
+portfolio = (prices * pd.Series(shares)).sum(axis=1) + cash_left
+
+# 3. Retrieve daily NYSE Composite index data to use as the benchmark for the portfolio.
+nya = qb.add_index("NYA", Resolution.DAILY).symbol
+nya_hist = qb.history(nya, datetime(2023, 1, 1), datetime(2026, 1, 1), Resolution.DAILY)
+nya_hist = nya_hist.droplevel(0)                          # keep only the date as the index
+nya_hist.index = pd.to_datetime(nya_hist.index).normalize()
+
+# 4. Align the portfolio and index series on matching dates so their performance is compared over a common sample.
+both = pd.concat([portfolio.rename("Portfolio"), nya_hist["close"].rename("NYA")],
+                 axis=1).dropna()
+
+# Add a starting observation before the first common trading date, with the portfolio at its initial $100,000 value and the index at its opening level.
+# The backtest entered the stock positions shortly after the market opened on 3 January 2023, so the index opening level is used as the benchmark starting point.
+start_row = pd.DataFrame({"Portfolio": [start_cash], "NYA": [float(nya_hist["open"].iloc[0])]},
+                         index=[both.index[0] - pd.Timedelta(days=1)])
+levels = pd.concat([start_row, both])
+
+print("Portfolio value on the last day in this notebook:", round(levels["Portfolio"].iloc[-1], 2),
+      " (backtest: 161,361.95)")
+
+# 5. Calculate daily percentage returns from the aligned portfolio and index value series.
+daily = levels.pct_change().dropna()
+
+# 6. Calculate a consistent set of performance and risk measures for each value series.
+def summary(level):
+    r = level.pct_change().dropna()
+    years = (level.index[-1] - level.index[0]).days / 365.25
+    vol = r.std() * np.sqrt(trading_days)
+    return {
+        "Total return (%)":        (level.iloc[-1] / level.iloc[0] - 1) * 100,
+        "Annualised return (%)":   ((level.iloc[-1] / level.iloc[0]) ** (1 / years) - 1) * 100,
+        "Average daily return (%)": r.mean() * 100,
+        "Daily volatility (%)":    r.std() * 100,
+        "Annual volatility (%)":   vol * 100,
+        "Sharpe ratio":            (r.mean() * trading_days - risk_free) / vol,
+        "Max drawdown (%)":        (level / level.cummax() - 1).min() * 100,
+        "Best day (%)":            r.max() * 100,
+        "Worst day (%)":           r.min() * 100,
+    }
+
+table = pd.DataFrame({"Equal-weight portfolio": summary(levels["Portfolio"]),
+                      "NYSE Composite (NYA)":   summary(levels["NYA"])})
+print(table.round(2))
+
+# Calculate additional comparisons to show the portfolio's relationship with the benchmark and how often it outperformed on a daily basis.
+beta = daily["Portfolio"].cov(daily["NYA"]) / daily["NYA"].var()
+corr = daily["Portfolio"].corr(daily["NYA"])
+beat = (daily["Portfolio"] > daily["NYA"]).mean() * 100
+print("\nBeta of portfolio vs NYA:", round(beta, 2))
+print("Correlation of daily returns:", round(corr, 2))
+print("% of days the portfolio did better than NYA:", round(beat, 1))
+print("Portfolio end value ($):", round(levels["Portfolio"].iloc[-1], 2))
+print("$100,000 in NYA would have become ($):",
+      round(start_cash * levels["NYA"].iloc[-1] / levels["NYA"].iloc[0], 2))
+
+# 7. Plot both daily-return series on one chart to compare their day-to-day fluctuations.
+plt.figure(figsize=(14, 6))
+plt.plot(daily.index, daily["NYA"] * 100, label="NYSE Composite (NYA)", linewidth=0.8, alpha=0.8)
+plt.plot(daily.index, daily["Portfolio"] * 100, label="Equal-weight portfolio", linewidth=0.8)
+plt.title("Daily returns: equal-weight portfolio vs NYSE Composite (Jan 2023 - Dec 2025)")
+plt.xlabel("Date"); plt.ylabel("Daily return (%)")
+plt.legend()
+plt.show()
+
+# 8. Rebase both series to 100 at the start so their cumulative growth can be compared on the same scale.
+growth100 = levels / levels.iloc[0] * 100
+plt.figure(figsize=(14, 6))
+plt.plot(growth100.index, growth100["NYA"], label="NYSE Composite (NYA)")
+plt.plot(growth100.index, growth100["Portfolio"], label="Equal-weight portfolio")
+plt.title("Growth of 100 invested on 3 Jan 2023")
+plt.xlabel("Date"); plt.ylabel("Value (start = 100)")
+plt.legend()
+plt.show()
+
+
